@@ -6,8 +6,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=24:00:00
 #SBATCH --mail-type=END,FAIL
-#SBATCH --output=/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR/outputs/one_shot_rlvr_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR/outputs/one_shot_rlvr_%j.err
+#SBATCH --output="/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR/outputs/one_shot_rlvr_%j.out"
+#SBATCH --error="/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR/outputs/one_shot_rlvr_%j.err"
 set -euo pipefail
 
 REPO_DIR="/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR"
