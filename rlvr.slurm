@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_DIR="/home/woody/iwi7/iwi7107h/One shot RLVR GIT/One-Shot-RLVR"
 TRAIN_SCRIPT_REL="scripts/train/training_1.5b_pi1_r128.sh"
 CONDA_ENV_NAME="rlvr"
-MODEL_PATH="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B/"
+MODEL_PATH="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B"
 
 # Fixed across all job runs so verl resume_mode=auto finds previous checkpoints
 CKPT_DIR="${REPO_DIR}/outputs/checkpoints"

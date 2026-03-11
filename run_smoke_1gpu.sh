@@ -7,7 +7,7 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
 
-MODEL_PATH="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B/"
+MODEL_PATH="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B"
 SMOKE_CKPT_DIR="outputs/smoke_test_checkpoints"
 mkdir -p "$SMOKE_CKPT_DIR"
 
