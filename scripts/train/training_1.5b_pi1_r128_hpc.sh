@@ -1,26 +1,23 @@
 #!/bin/bash
 # =============================================================================
-# training_1.5b_dsr_sub.sh
-# One-Shot-RLVR training — Qwen2.5-Math-1.5B, DeepScaleR subset, 4×A100
-# (updated for HPC, no wandb, absolute paths)
-#
-# Train data: data/train/one_shot_rlvr/dsr_sub.parquet
+# training_1.5b_pi1_r128_hpc.sh
+# One-Shot-RLVR training — Qwen2.5-Math-1.5B, π₁ r128, 4×A100, single node
 #
 # Run with:
 #   conda activate rlvr_train
-#   bash scripts/train/training_1.5b_dsr_sub.sh
+#   bash scripts/train/training_1.5b_pi1_r128_hpc.sh
 # =============================================================================
 set -euo pipefail
 set -x
 
 REPO_ROOT=/home/woody/iwi7/iwi7107h/One-Shot-RLVR
 MODEL_PATH=/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B
-TRAIN_FILE=${REPO_ROOT}/data/train/one_shot_rlvr/dsr_sub.parquet
+TRAIN_FILE=${REPO_ROOT}/data/train/one_shot_rlvr/pi1_r128.parquet
 VAL_FILE=${REPO_ROOT}/data/test/math500.parquet
 CHECKPOINTS_DIR=${REPO_ROOT}/output/checkpoints
-TENSORBOARD_LOG_DIR=${REPO_ROOT}/output/tensorboard/verl_few_shot/Qwen2.5-Math-1.5B-dsr_sub
-MODEL_OUTPUTS_JSONL=${REPO_ROOT}/output/model_outputs/val_generations_dsr_sub.jsonl
-LOG_FILE=${REPO_ROOT}/output/logs/training_dsr_sub.log
+TENSORBOARD_LOG_DIR=${REPO_ROOT}/output/tensorboard/verl_few_shot/Qwen2.5-Math-1.5B-pi1_r128_4xa100
+MODEL_OUTPUTS_JSONL=${REPO_ROOT}/output/model_outputs/val_generations_pi1_r128.jsonl
+LOG_FILE=${REPO_ROOT}/output/logs/training_pi1_r128_4xa100.log
 
 mkdir -p "${CHECKPOINTS_DIR}"
 mkdir -p "${TENSORBOARD_LOG_DIR}"
@@ -72,7 +69,7 @@ python3 -m verl.trainer.main_ppo \
  trainer.logger=['console','tensorboard'] \
  trainer.val_generations_to_log_to_wandb=0 \
  trainer.project_name='verl_few_shot' \
- trainer.experiment_name='Qwen2.5-Math-1.5B-dsr_sub' \
+ trainer.experiment_name='Qwen2.5-Math-1.5B-pi1_r128_4xa100' \
  trainer.checkpoints_dir="${CHECKPOINTS_DIR}" \
  +trainer.val_before_train=True \
  trainer.n_gpus_per_node=4 \

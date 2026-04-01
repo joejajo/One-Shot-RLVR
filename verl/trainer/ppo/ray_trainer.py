@@ -44,7 +44,11 @@ import tempfile
 from filelock import FileLock
 import json
 from collections import Counter
-import wandb
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 import re
 import matplotlib.pyplot as plt
 import random
@@ -672,6 +676,34 @@ class RayPPOTrainer(object):
         wandb.log({"generations": new_table}, step=self.global_steps)
         self.validation_table = new_table
 
+    def _write_val_outputs_to_jsonl(self, inputs, outputs, scores):
+        """Append this validation step's generations to a JSONL file.
+
+        Each line is a JSON object with keys: step, input, output, score.
+        File path is read from the MODEL_OUTPUTS_JSONL env var, which is set
+        by the training launcher script. Falls back to a path under the CWD.
+        """
+        import os
+        import json
+
+        jsonl_path = os.environ.get(
+            'MODEL_OUTPUTS_JSONL',
+            os.path.join('output', 'model_outputs', 'val_generations.jsonl')
+        )
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+
+        with open(jsonl_path, 'a', encoding='utf-8') as f:
+            for inp, out, score in zip(inputs, outputs, scores):
+                record = {
+                    'step': self.global_steps,
+                    'input': inp,
+                    'output': out,
+                    'score': score,
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+        print(f'[JSONL] wrote {len(inputs)} val generations to {jsonl_path}')
+
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
@@ -730,6 +762,7 @@ class RayPPOTrainer(object):
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations_to_wandb(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._write_val_outputs_to_jsonl(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)

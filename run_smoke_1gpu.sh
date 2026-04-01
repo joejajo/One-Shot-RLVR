@@ -1,20 +1,37 @@
 #!/bin/bash
-# Smoke test for 1x A100 - runs 3 training steps then exits
+# =============================================================================
+# run_smoke_1gpu.sh
+# Quick smoke test — 1×A100, 3 epochs, tiny batch — verifies the full
+# training stack starts correctly on woody.
+#
+# Fixed from original:
+#   - checkpoint dir: output/ (was outputs/ — typo)
+#   - tee log path:   absolute under output/logs/
+#   - data paths:     absolute
+# =============================================================================
 set -x
+
+REPO_ROOT=/home/woody/iwi7/iwi7107h/One-Shot-RLVR
+MODEL_PATH=/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B
+SMOKE_CKPT_DIR=${REPO_ROOT}/output/smoke_checkpoints/1gpu
+LOG_FILE=${REPO_ROOT}/output/logs/smoke_1gpu.log
+
+mkdir -p "${SMOKE_CKPT_DIR}"
+mkdir -p "$(dirname "${LOG_FILE}")"
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
+export WANDB_DISABLED=true
+export WANDB_MODE=disabled
 
-MODEL_PATH="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B"
-SMOKE_CKPT_DIR="outputs/smoke_test_checkpoints"
-mkdir -p "$SMOKE_CKPT_DIR"
+cd "${REPO_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
  algorithm.adv_estimator=grpo \
- data.train_files=data/train/one_shot_rlvr/pi1_r128.parquet \
- data.val_files=data/test/math500.parquet \
+ data.train_files="${REPO_ROOT}/data/train/one_shot_rlvr/pi1_r128.parquet" \
+ data.val_files="${REPO_ROOT}/data/test/math500.parquet" \
  data.train_batch_size=8 \
  data.val_batch_size=16 \
  data.max_prompt_length=512 \
@@ -53,8 +70,9 @@ python3 -m verl.trainer.main_ppo \
  trainer.save_freq=-1 \
  trainer.test_freq=-1 \
  trainer.default_hdfs_dir=null \
- trainer.total_epochs=3 2>&1 | tee outputs/smoke_test.log
+ trainer.total_epochs=3 \
+ 2>&1 | tee "${LOG_FILE}"
 
 echo "=================================================="
-echo "Smoke test finished. Check outputs/smoke_test.log"
+echo "1-GPU smoke test finished. Log: ${LOG_FILE}"
 echo "=================================================="

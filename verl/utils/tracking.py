@@ -22,7 +22,7 @@ from typing import List, Union, Dict, Any
 
 
 class Tracking(object):
-    supported_backend = ["wandb", "mlflow", "swanlab", "console"]
+    supported_backend = ["wandb", "mlflow", "swanlab", "console", "tensorboard"]
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = 'console', config=None):
         if isinstance(default_backend, str):
@@ -68,16 +68,39 @@ class Tracking(object):
             self.console_logger = LocalLogger(print_to_console=True)
             self.logger['console'] = self.console_logger
 
+        if 'tensorboard' in default_backend:
+            import os
+            from torch.utils.tensorboard import SummaryWriter
+            # Read log dir from env var (set by the SLURM launcher script)
+            # Falls back to ./output/tensorboard/<project>/<experiment>
+            tb_log_dir = os.environ.get(
+                'TENSORBOARD_LOG_DIR',
+                os.path.join('output', 'tensorboard', project_name, experiment_name)
+            )
+            os.makedirs(tb_log_dir, exist_ok=True)
+            self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
+            self.logger['tensorboard'] = self.tb_writer
+            print(f'[Tracking] TensorBoard logging to: {tb_log_dir}')
+
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == 'tensorboard':
+                    # SummaryWriter has a different API — log each scalar individually
+                    for k, v in data.items():
+                        if isinstance(v, (int, float)):
+                            logger_instance.add_scalar(tag=k, scalar_value=v, global_step=step)
+                    logger_instance.flush()
+                else:
+                    logger_instance.log(data=data, step=step)
 
     def __del__(self):
         if 'wandb' in self.logger:
             self.logger['wandb'].finish(exit_code=0)
         if 'swanlab' in self.logger:
             self.logger['swanlab'].finish()
+        if 'tensorboard' in self.logger:
+            self.logger['tensorboard'].close()
 
 
 class _MlflowLoggingAdapter:
