@@ -401,6 +401,14 @@ class RayPPOTrainer(object):
         self.history_accuracy_with_step = {}
         self.validation_accuracy_by_source = {}
 
+        # Track last checkpoint folder so we can delete it when the next one is saved
+        self._last_ckpt_folder = None
+
+        # Buffer for train JSONL records — flushed every JSONL_SHARD_STEPS steps
+        self._train_jsonl_buffer = []
+        # Constant: how many steps per JSONL shard file
+        self._JSONL_SHARD_STEPS = 50
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -676,42 +684,110 @@ class RayPPOTrainer(object):
         wandb.log({"generations": new_table}, step=self.global_steps)
         self.validation_table = new_table
 
-    def _write_val_outputs_to_jsonl(self, inputs, outputs, scores):
-        """Append this validation step's generations to a JSONL file.
-
-        Each line is a JSON object with keys: step, input, output, score.
-        File path is read from the MODEL_OUTPUTS_JSONL env var, which is set
-        by the training launcher script. Falls back to a path under the CWD.
-        """
+    def _jsonl_output_dir(self):
+        """Return the shared folder for all JSONL shard files."""
         import os
-        import json
-
-        jsonl_path = os.environ.get(
+        base = os.environ.get(
             'MODEL_OUTPUTS_JSONL',
             os.path.join('output', 'model_outputs', 'val_generations.jsonl')
         )
-        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        # Use the directory that MODEL_OUTPUTS_JSONL points into
+        out_dir = os.path.dirname(base)
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    def _shard_filename(self, prefix, step, shard_steps=None):
+        """Return a shard filename like val_steps_0000-0049.jsonl."""
+        if shard_steps is None:
+            shard_steps = self._JSONL_SHARD_STEPS
+        shard_start = (step // shard_steps) * shard_steps
+        shard_end   = shard_start + shard_steps - 1
+        return f'{prefix}_steps_{shard_start:04d}-{shard_end:04d}.jsonl'
+
+    def _extract_io(self, sequences_str):
+        """Return (input_text, output_text) extracted from a decoded sequence."""
+        import re
+        input_match  = re.search(r'<\|im_start\|>user\n([\s\S]*?)<\|im_end\|>', sequences_str)
+        output_match = re.search(r'<\|im_start\|>assistant\n([\s\S]*?)<\|im_end\|>', sequences_str)
+        input_text  = input_match.group(1).strip()  if input_match  else ""
+        output_text = output_match.group(1).strip() if output_match else sequences_str
+        return input_text, output_text
+
+    def _write_val_outputs_to_jsonl(self, score_records):
+        """Write this validation step's generations to a per-50-step shard JSONL file.
+
+        Files are written to the shared model_outputs folder:
+          val_steps_0000-0049.jsonl, val_steps_0050-0099.jsonl, …
+        """
+        import json
+
+        out_dir  = self._jsonl_output_dir()
+        filename = self._shard_filename('val', self.global_steps)
+        jsonl_path = os.path.join(out_dir, filename)
 
         with open(jsonl_path, 'a', encoding='utf-8') as f:
-            for inp, out, score in zip(inputs, outputs, scores):
-                record = {
-                    'step': self.global_steps,
-                    'input': inp,
-                    'output': out,
-                    'score': score,
+            for record in score_records:
+                input_text, output_text = self._extract_io(record.get("sequences_str", ""))
+                json_record = {
+                    'step':   self.global_steps,
+                    'input':  input_text,
+                    'output': output_text,
+                    'score':  record.get("score", 0),
+                    'index':  record.get("index", "")
                 }
-                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                f.write(json.dumps(json_record, ensure_ascii=False) + '\n')
 
-        print(f'[JSONL] wrote {len(inputs)} val generations to {jsonl_path}')
+        print(f'[JSONL-VAL] step={self.global_steps} wrote {len(score_records)} records → {jsonl_path}')
+
+    def _write_train_outputs_to_jsonl(self, score_records):
+        """Buffer training generations and flush to a per-50-step shard JSONL file.
+
+        Records are buffered in memory and written once every JSONL_SHARD_STEPS
+        steps to avoid O(N) tiny writes. Files live in the shared model_outputs
+        folder:
+          train_steps_0000-0049.jsonl, train_steps_0050-0099.jsonl, …
+        """
+        import json
+
+        # Enrich each incoming record with the current step
+        for record in score_records:
+            input_text, output_text = self._extract_io(record.get("sequences_str", ""))
+            self._train_jsonl_buffer.append({
+                'step':   self.global_steps,
+                'input':  input_text,
+                'output': output_text,
+                'score':  record.get("score", 0),
+                'index':  record.get("index", "")
+            })
+
+        # Flush when we cross a shard boundary (i.e. current step is last in shard)
+        shard_last = ((self.global_steps + 1) % self._JSONL_SHARD_STEPS) == 0
+        if shard_last and self._train_jsonl_buffer:
+            out_dir  = self._jsonl_output_dir()
+            filename = self._shard_filename('train', self.global_steps)
+            jsonl_path = os.path.join(out_dir, filename)
+
+            with open(jsonl_path, 'a', encoding='utf-8') as f:
+                for json_record in self._train_jsonl_buffer:
+                    f.write(json.dumps(json_record, ensure_ascii=False) + '\n')
+
+            n = len(self._train_jsonl_buffer)
+            self._train_jsonl_buffer = []
+            print(f'[JSONL-TRAIN] steps …-{self.global_steps} flushed {n} records → {jsonl_path}')
 
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
 
-        # Lists to collect samples for the table
+        # Lists to collect samples for the wandb table
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        all_score_records = []
+
+        # Accumulators for sequence-length metrics
+        all_prompt_lengths  = []
+        all_response_lengths = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -720,7 +796,11 @@ class RayPPOTrainer(object):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
 
-            n_val_samples = self.config.actor_rollout_ref.rollout.n_val
+            rollout_cfg = self.config.actor_rollout_ref.rollout
+            n_val_samples = rollout_cfg.get('n_val', None)
+            if n_val_samples is None:
+                val_kwargs = rollout_cfg.get('val_kwargs', {})
+                n_val_samples = val_kwargs.get('n', rollout_cfg.get('n', 1))
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             
             # Store original inputs
@@ -744,15 +824,32 @@ class RayPPOTrainer(object):
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
 
+            # ------------------------------------------------------------------
+            # Sequence-length accounting (prompt + response)
+            # ------------------------------------------------------------------
+            attn_mask = test_gen_batch_padded.batch['attention_mask'][:test_output_gen_batch.batch['responses'].shape[0]]
+            resp_ids  = test_output_gen_batch.batch['responses']
+            max_resp_len = resp_ids.shape[1]
+
+            # prompt lengths = valid tokens in the prompt portion of attention_mask
+            prompt_mask = attn_mask
+            prompt_lens = prompt_mask.sum(-1).float().cpu()
+            all_prompt_lengths.extend(prompt_lens.tolist())
+
+            # response lengths = non-pad tokens in each response
+            resp_non_pad = (resp_ids != self.tokenizer.pad_token_id).sum(-1).float().cpu()
+            all_response_lengths.extend(resp_non_pad.tolist())
+
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch['responses']
+            output_ids = resp_ids
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor, score_record= self.val_reward_fn(test_batch)
+            reward_tensor, score_record = self.val_reward_fn(test_batch)
+            all_score_records.extend(score_record)
 
             # Store scores
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -762,28 +859,58 @@ class RayPPOTrainer(object):
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations_to_wandb(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-        self._write_val_outputs_to_jsonl(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._write_val_outputs_to_jsonl(score_records=all_score_records)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        data_sources  = np.concatenate(data_source_lst, axis=0)
 
-        # evaluate test_score based on data source
+        # ------------------------------------------------------------------
+        # Build metric_dict — all keys will flow into TensorBoard via logger
+        # ------------------------------------------------------------------
+        metric_dict = {}
+
+        # 1. Per-data-source accuracy
         data_source_reward = {}
         for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+            ds = data_sources[i]
+            data_source_reward.setdefault(ds, []).append(reward_tensor[i].item())
 
-        metric_dict = {}
+        all_rewards_flat = []
         for data_source, rewards in data_source_reward.items():
-            mean_reward = np.mean(rewards)
+            mean_reward = float(np.mean(rewards))
             metric_dict[f'val/test_score/{data_source}'] = mean_reward
-            
-            # Store validation accuracy by data source and step
-            if data_source not in self.validation_accuracy_by_source:
-                self.validation_accuracy_by_source[data_source] = {}
+            all_rewards_flat.extend(rewards)
+
+            # Store history for checkpoint JSON
+            self.validation_accuracy_by_source.setdefault(data_source, {})
             self.validation_accuracy_by_source[data_source][self.global_steps] = mean_reward
+
+        # 2. Aggregate accuracy across all sources
+        if all_rewards_flat:
+            arr = np.array(all_rewards_flat)
+            metric_dict['val/accuracy/mean'] = float(np.mean(arr))
+            metric_dict['val/accuracy/max']  = float(np.max(arr))
+            metric_dict['val/accuracy/min']  = float(np.min(arr))
+
+        # 3. Response-length metrics
+        if all_response_lengths:
+            rl = np.array(all_response_lengths)
+            metric_dict['val/response_length/mean'] = float(np.mean(rl))
+            metric_dict['val/response_length/max']  = float(np.max(rl))
+            metric_dict['val/response_length/min']  = float(np.min(rl))
+            metric_dict['val/response_length/std']  = float(np.std(rl))
+            # Clip ratio: fraction of responses that hit the max response length
+            max_resp_len_cfg = self.config.data.max_response_length
+            metric_dict['val/response_length/clip_ratio'] = float(
+                np.mean(rl >= max_resp_len_cfg)
+            )
+
+        # 4. Prompt-length metrics
+        if all_prompt_lengths:
+            pl = np.array(all_prompt_lengths)
+            metric_dict['val/prompt_length/mean'] = float(np.mean(pl))
+            metric_dict['val/prompt_length/max']  = float(np.max(pl))
+            metric_dict['val/prompt_length/min']  = float(np.min(pl))
 
         return metric_dict
 
@@ -894,6 +1021,7 @@ class RayPPOTrainer(object):
             os.replace(tmp_file, score_source_path)
 
     def _save_checkpoint(self):
+        import shutil
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
                                                 f'global_step_{self.global_steps}')
@@ -936,6 +1064,19 @@ class RayPPOTrainer(object):
                                                            'latest_checkpointed_iteration.txt')
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
+
+        # ------------------------------------------------------------------
+        # Delete the PREVIOUS checkpoint folder now that the new one is fully
+        # written (trainer-level deletion of the entire global_step_* tree).
+        # This is independent of the per-worker remove_previous_ckpt flag.
+        # ------------------------------------------------------------------
+        if self._last_ckpt_folder is not None and os.path.isdir(self._last_ckpt_folder):
+            try:
+                shutil.rmtree(self._last_ckpt_folder)
+                print(f'[Checkpoint] Deleted previous checkpoint folder: {self._last_ckpt_folder}')
+            except Exception as e:
+                print(f'[Checkpoint] WARNING: could not delete {self._last_ckpt_folder}: {e}')
+        self._last_ckpt_folder = local_global_step_folder
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
@@ -1004,7 +1145,8 @@ class RayPPOTrainer(object):
                 self.validation_accuracy_by_source = {}
 
         dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        self.train_dataloader = torch.load(dataloader_local_path)
+        import dill as _dill
+        self.train_dataloader = torch.load(dataloader_local_path, weights_only=False, pickle_module=_dill)
         if isinstance(self.train_dataloader.dataset, RLHFDataset):
             self.train_dataloader.dataset.resume_dataset_state()
         
@@ -1175,6 +1317,7 @@ class RayPPOTrainer(object):
                         # Update metrics with returned values instead of direct logging
                         # logger.log(data=score_metrics, step=self.global_steps)
                         metrics.update(score_metrics)
+                        self._write_train_outputs_to_jsonl(score_records)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
